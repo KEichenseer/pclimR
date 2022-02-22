@@ -1,0 +1,900 @@
+# main MCMC functions for models
+
+Updatelambda <- function(beta, D, Alam, Blam, nbasis) {
+  # Update lambda  (with informative prior based on GCV of naive spline)
+  newscale <- (1/Blam + 0.5 * t(beta) %*% D %*% beta)^(-1)
+  lambda <- rgamma(1, shape = Alam + (nbasis - 2)/2, scale = newscale)
+  return(lambda)
+}
+# functions to estimate various densities (up to a constant)
+# priors
+### REMOVE LOG SCALE for Alpha
+logprior_ALPHA = function (value, lo, hi){
+  dunif(value, lo, hi, log = TRUE)
+}
+
+logprior_BETA = function (value, lo, hi, logscale=FALSE){
+  if(logscale){
+    dunif(log(value), log(lo), log(hi), log = TRUE)
+  } else {
+    dunif(value, lo, hi, log = TRUE)
+  }
+}
+# likelihood
+loglik = function(B,coeff,y,sdy){
+  fest <- as.vector(B %*% coeff) # The f estimate at each observation
+  return( sum(
+    dnorm(y, mean = fest, sd = sdy, log = TRUE)
+  ))
+}
+# conditional posterior of coefficients and lambda
+logdensity_coeff = function(coeff,H,lambda,D,tBy,Alam,num_basis,Blam){
+  Q <- .MakeSymmetric(solve(H + lambda*D))
+  return( sum(
+    dmvn(coeff, mu = as.vector(Q %*% tBy), sigma = as.matrix(Q)),
+    dgamma(lambda,shape = Alam + (num_basis - 2)/2, scale = Blam)
+  ))
+}
+
+
+#' The Main MCMC function for the ALPHA BETA model
+#'
+#' \code{runMCMCALPHABETA} runs the MCMC algorithm to estimate ALPHA (shift)
+#' and BETA (stretch) of a correlation section to match the reference section.
+#'
+#' @param x dataset as a \code{CSMproxydata} object.
+#' @param initsObject \code{CSMautoinits} object: if supplied many values can
+#'                    be inherited from this (marked ** below). Not currently
+#'                    being used.
+#'
+#' @param num.knots number of knots to be used in spline. If num.knots is
+#' large (>> 100), the algorithm is very slow.
+#' @param ref_min maximum value of position to be considered.
+#' @param ref_max minimum value of position to be considered.
+#' @param overlap_min minimum number of points that need to overlap between the
+#' reference and the correlation section.
+#'
+#' @param nIter number of iterations for MCMC.
+#' @param nChains number of chains for MCMC.
+#' @param adapt_SD Until which iteration should the proposal standard deviation for
+#' \code{ALPHA} and \code{BETA} in the Metropolis-Hastings step be adapted? Defaults to
+#' \code{1000}, may take any positive integer \code{>= 2} and \code{< nIter}. Must
+#' be \code{>= adapt_T}. Should be > \code{>= adapt_T+100}.
+#' @param adapt_SD_decay Exponential Decay factor for the weights in the adaptation
+#' of the proposal standard deviations.  Defaults to \code{100}. Increase for slower
+#' decay, leading to slower, but more precise convergence of the proposal standard
+#' deviations.
+#' @param tempering \code{TRUE} for tempering (default), \code{FALSE} for
+#'                  no tempering
+#' @param adapt_T Until which iteration should the temperatures be adapted? Defaults to \code{800}, may take on any positive
+#' integer \code{> 2} and \code{< nIter}. The value specifies the number of iterations during which
+#' temperatures will be adapted. \code{nChains} needs to be \code{>= 3}, as the temperatures of the cold chain and
+#' the hottest chain are never adapted. \code{FALSE} for no adaptation, i.e.
+#' using the \code{T_init} values throughout (default), nChains may be \code{2}.
+#' @param adapt_T_interval # Spacing of the adaptive steps for temperature. May be any
+#' positive integer \code{<= adapt_T-2}, defaults to \code{20}. Increase for slower, but
+#' more precise convergence. Should be << \code{adapt_T} to allow for multiple adaptive steps.
+#' @param adapt_T_allratios Should all temper ratios be calculated and used in each
+#' iteration for the temperature adaptation? \code{TRUE} for yes (default), leads to
+#' faster convergence. \code{FALSE} for only using the temper ratio of the chain pair
+#' for which a swap is proposed.
+#' @param t_null A decay factor for the step sizes of the temperature adaptation. May be
+#' any positive integer, defaults to 10. Larger values lead to slower, but more precise
+#' convergence of the temperatures.
+#'
+#' @param alpha_lo ** minimum value of range of \code{ALPHA}.
+#' @param alpha_hi ** maximum value of range of \code{ALPHA}.
+#' @param beta_lo ** minimum value of range of \code{BETA}.
+#' @param beta_hi ** maximum value of range of \code{BETA}.
+#' @param beta_logscale ** whether prior and sampling for \code{BETA} is on log-scale or not.
+#' @param Alam prior shape parameter for spline smoothing parameter \code{lambda}
+#' @param Blam prior scale parameter for spline smoothing parameter \code{lambda}
+#'             prior is Gamma(shape=Alam,scale=Blam) mean of prior = Alam * Blam.
+#' @param A_sdy prior shape parameter for \code{sdy}
+#' @param B_sdy prior scale parameter for \code{sdy} #### Continue here!!! ####
+#'
+#'
+#'
+#'
+#'
+#'
+#'
+#' @param T_adapt should the temperatures be adapted? \code{FALSE} for no adaptation (default), \code{TRUE} for
+#'                  adaptation (then needs adapt_it)
+#' @param prop_prop proportion of proposals for BETAs using random walk.
+#' @param ALPHAsd sd for random walk proposal on \code{ALPHA}, expressed as a
+#'                fraction of the range (or log-scale range). Can vary between
+#'                chains. Values are recycled to length \code{nChains}.
+#' @param BETAsd sd for random walk proposal on \code{BETA}, expressed as a
+#'                fraction of the range (or log-scale range). Can vary between
+#'                chains. Values are recycled to length \code{nChains}.
+#' @param lambda_init initial value for lambda.
+#' @param coeff_init initial value(s) for spline coefficients.
+#' @param ALPHA_init ** vector of ALPHA inits if \code{CSMautoinits} object not supplied.
+#' @param BETA_init ** vector of BETA inits if \code{CSMautoinits} object not supplied.
+#' @param visualise plot progress every \code{visualise} iterations,
+#'                  \code{FALSE} means don't plot, \code{"end"} only at the end
+#'                  (the default)
+#' @param quiet whether to suppress messages
+#'
+#' @return An object of class CSM_MCMC consisting of a list containing:
+#'   \item{call}{the parameters of the call.}
+#'   \item{ALPHA}{2D numeric array of ALPHA at each iteration. Contains one row per chain.}
+#'   \item{BETA}{2D numeric array of BETA at each iteration. Contains one row per chain.}
+#'   \item{thetaest}{3D numeric array of the new estimated heights of the correlation
+#'   section at each iteration. The first dimension specifies the chain, the second dimension
+#'   the iteration number, the third dimension the data point of the correlation section.}
+#'   \item{coeff}{3D numeric array of the Spline coefficients at each iteration.
+#'   The first dimension specifies the chain, the second dimension the iteration number, the
+#'   third dimension the knot number.}
+#'   \item{lambda}{2D numeric array of the smoothing coefficient for the Splines. Contains
+#'   one row per chain. }
+#'   \item{sdy}{2D numeric array of the residual standard deviation of the Splines. Contains
+#'   one row per chain. }
+#'   \item{ext_knots}{vector of the position of the knots of the Splines.}
+#'   \item{logpost}{2D numeric array of the log-posterior probability. Contains
+#'   one row per chain.}
+#'   \item{accept}{2D logical array of the acceptance (TRUE/FALSE) of the proposals
+#'   in the Metropolis-Hastings step at each iteration. Contains one row per chain.}
+#'   \item{ALPHAsd}{2D numeric array of the standard deviation of the proposals
+#'   for ALPHA in the Metropolis-Hastings step at each iteration. Contains one row per chain.}
+#'   \item{BETAsd}{2D numeric array of the standard deviation of the proposals
+#'   for BETA in the Metropolis-Hastings step at each iteration. Contains one row per chain.}
+#'   \item{Tem}{2D numeric array of the temperature of the chains at each step at each iteration.
+#'   Contains one row per chain.}
+#'   \item{chains}{integer vector of the colder chain of the chain pair that was proposed to
+#'   swap in the current iteration.}
+#'   \item{temperAccept}{logical vector indicating whether the chain swap was accepted in
+#'   the current iteration.}
+#'   \item{adapt_it}{integer vector indicating the iterations in which the temperatures of the
+#'   chains were adapted.}
+
+
+#' @import fda msm conquer tidyquant zoo splines MCMCpack mvnfast
+#'
+#' @export
+#'
+runMCMCALPHABETA = function (
+  ## data
+  x = initsObject$call$x,
+  initsObject = NA, # CSMautoinits object: if supplied many values can be inherited from this.
+
+  ## model parameters
+  num.knots = NA,
+  ref_min,
+  ref_max,
+  overlap_min = 15,# minimal overlap between two sections
+
+  ## MCMC setup
+  nIter = 1, # number of iterations
+  nChains = 5, # number of chains
+  adapt_SD = 1000, # number of iterations for which SD should be adapted, or FALSE for no adaptation
+  adapt_SD_decay = 100, # decay factor for the weights of SD adaptation (increase for slower decay)
+  tempering = TRUE,
+  adapt_T = 100, # number of iterations for which temperature should be adapted, or FALSE for no adaptation
+  adapt_T_interval = 20, # spacing of the adaptive steps for temperatures. Increase for slower, but more precise convergence
+  adapt_T_allratios = TRUE, # should all temper ratios be calculated in each iteration
+  t_null = 10, # decay factor for the tempering adaptation. Increase for faster but less precise convergence
+
+  ## priors
+  # prior limits on ALPHA and BETA
+  alpha_lo = initsObject$call$ranges["ALPHA","min"],
+  alpha_hi = initsObject$call$ranges["ALPHA","max"],
+  beta_lo = initsObject$call$ranges["BETA","min"],
+  beta_hi = initsObject$call$ranges["BETA","max"],
+  beta_logscale = if(class(initsObject)=="CSMinits") {initsObject$call$logGrid["BETA"]} else {FALSE},
+  # prior parameters for spline smoothing parameter lambda
+  Alam = 1,
+  Blam = 50000,
+  # prior parameters for sdy
+  A_sdy = 3,
+  B_sdy = 0.1,
+
+  ## initial values
+  # initial temperatures, will be used throughout if adapt_T = FALSE
+  T_init = NULL, # initial values for temperature, will be used
+  # sd for random walk proposals
+  ALPHAsd_init = (alpha_hi-alpha_lo)/2,
+  BETAsd_init = if(beta_logscale) (log(beta_hi)-log(beta_lo))/2 else (beta_hi-beta_lo)/2,
+  # other intial values
+  lambda_init = 1,
+  coeff_init = 0,
+  ALPHA_init = NULL,
+  BETA_init = NULL,
+
+  visualise = "end",
+  quiet=FALSE
+){
+  #### parameter validation ####
+  # needs to be extended
+  # check lo and hi values
+  if(alpha_lo>=alpha_hi) stop("alpha_lo must be less than alpha_hi")
+  if(beta_lo>=beta_hi) stop("beta_lo must be less than beta_hi")
+  if(any(beta_lo<0,beta_hi<0))
+    # changed: alpha can be negative
+    stop("lo and hi values of beta must be positive.")
+  # check nChains
+  if (!(length(nChains)==1) & !is.integer(nChains) & !(nChains>0)) {
+    stop("nChains must be a postive integer.")
+  }
+
+  # check if adapt_SD >= adapt_T
+  if(adapt_SD < adapt_T) {
+    adapt_SD <- adapt_T
+    warning("adapt_SD needs to be >= adapt_T and was set to ", adapt_T)
+  }
+
+  # # check and set tempering values
+  # if (length(tempering)!=1 && !is.logical(tempering))
+  #   stop("tempering must be a single logical value")
+  # if (any(is.na(T))){
+  #   if (tempering) {
+  #     # nChains values spaced log-uniform from 1 to 1000
+  #     T = exp(log(1000)*((1:nChains)-1)/(nChains-1))
+  #   } else {
+  #     T = rep(1,nChains)
+  #   }
+  # } else if (length(T)<nChains) {
+  #   T = rep(T,length.out=nChains)
+  #   if(nChains%%length(T)!=0)
+  #     warning("nChains is not a multiple of length(T).")
+  # }
+  # if (length(T)>nChains)
+  #   warning("nChains less than length(T). Only first ",nChains,
+  #           " values of T will be used.")
+  # if (any(T!=1) & !quiet) {
+  #   if (tempering) {
+  #     cat("Tempering with ")
+  #   } else {
+  #     cat("No tempering but ")
+  #   }
+  #   cat("chains at temperatures\n",T,"\n")
+  # }
+
+  if (visualise=="end") visualise = nIter
+
+  # check inits have non-zero prior probability (if they were manually supplied)
+  if(!(is.null(ALPHA_init)) & !(is.null(BETA_init))){
+  if (any(!is.finite(logprior_ALPHA(ALPHA_init, alpha_lo, alpha_hi))))
+    stop("Initial value for ALPHA does not have finite prior probability density.")
+  if (any(!is.finite(logprior_BETA(BETA_init, beta_lo, beta_hi))))
+    stop("Initial value for BETA does not have finite prior probability density.")
+}
+
+  proxyData = x$proxy
+  position = x$height
+
+  # Create the splines based upon the number of knots and the locations
+  spline_order <- 4 # i.e. cubic
+  num_basis <- num.knots + spline_order - 2
+  knots = seq(ref_min, ref_max,length.out=num.knots)
+  # use ext_knots to speed up splinedesign
+  ext_knots <- c(rep(knots[1], spline_order-1), knots,
+                 rep(knots[num.knots], spline_order-1))
+  Bspl.basis <- create.bspline.basis(knots, norder = spline_order)
+  # penalty matrix for these splines
+  D <- bsplinepen(Bspl.basis)
+  knotRange <- range(knots)
+  rm(Bspl.basis)
+
+  ####  PARAMETERS - INITIALISATIONS ####################################
+
+  #### variables to store values in each iteration
+  coeff <- array(NA_real_, dim=c(nChains,nIter,num_basis)) # spline coefficients
+  lambda <- array(NA_real_, dim=c(nChains,nIter))     # smoothing coefficient
+  HR <- array(NA_real_, dim=c(nChains,nIter))         # Hastings ratio
+  ALPHA <- array(NA_real_, dim=c(nChains,nIter))      # ALPHA
+  BETA <- array(NA_real_, dim=c(nChains,nIter))       # BETA
+  ALPHA_new <- array(NA_real_, dim=c(nChains,nIter))  # ALPHA proposals
+  BETA_new <- array(NA_real_, dim=c(nChains,nIter))   # BETA proposals
+  logpost <- array(NA_real_, dim=c(nChains,nIter))    # conditional log posterior at new values
+  accept <- array(NA, dim=c(nChains,nIter))           # whether move was accepted
+  chains <- rep(NA_integer_, nIter)        # chains proposed for swap
+  temperRatio <- array(NA_real_, dim=c(nChains-1,nIter))      # tempering ratio
+  temperRatioCapped <- array(NA_real_, dim=c(nChains-1,nIter))
+  temperAccept <- rep(NA,nIter)             # whether swap was accepted
+  sdy <- array(NA, dim=c(nChains,nIter))              # SD
+
+  # for adaptive tempering
+  Tem <- array(NA_real_, dim = c(nChains, nIter))
+  adapt_it <- as.integer(c(seq(adapt_T_interval+1,adapt_T, by = adapt_T_interval)))
+  A <- array(NA_real_, dim = c(nChains, length(adapt_it)+1))
+  dS <- array(NA_real_, dim = c(nChains, length(adapt_it)+1))
+
+  # for adaptive proposal SD
+  ALPHA_diff <- array(NA_real_, dim = c(nChains, nIter))
+  BETA_diff <- array(NA_real_, dim = c(nChains, nIter))
+  v_ALPHA <- array(NA_real_, dim = c(nChains-1, nIter))
+  v_BETA <- array(NA_real_, dim = c(nChains-1, nIter))
+
+  ALPHAsd <-  array(NA, dim=c(nChains,nIter))
+  BETAsd <-  array(NA, dim=c(nChains,nIter))
+
+  allWeights <- exp((-(nIter-2)):0/adapt_SD_decay)
+
+  # added these to monitor strange behaviour
+  logpostold <- array(NA_real_, dim=c(nChains,nIter))    # conditional log posterior at new values
+  logpostnew <- array(NA_real_, dim=c(nChains,nIter))    # conditional log posterior at new values
+  theta_new <- array(NA_real_, dim=c(nChains,nIter,sum(x$N)))    # ref heights and proposed corr heights
+  #B_new_c1 = list()
+  #B_old_c1 = list()
+
+
+  #thetaest - part ref section, part section you want to correlate
+  valid = !(is.na(position)|is.na(proxyData)) # list of valid lines of data
+  posn_ref = position[1,][valid[1,]]
+  posn_cor = position[2,][valid[2,]]
+  # combined proxy dataset
+  y = c(proxyData[1,][valid[1,]], proxyData[2,][valid[2,]])
+
+  ref      = length(posn_ref)
+  combined = length(posn_cor)+length(posn_ref)
+
+  thetaest <- array(NA_real_, dim=c(nChains,nIter,combined))
+
+
+  # Initialise variables where NA is not suitable first value
+
+  ### Automatic initialisation
+  ##
+  if(is.null(ALPHA_init) | is.null(BETA_init)) {
+  for(j in 1:nChains) {
+
+  ## Step 1: Sample an initial ALPHA and BETA value from the allowed range.
+  ##         check for overlap to ensure that the values are valid. Re-sample
+  ##         otherwise.
+  overlap_indicator <- FALSE
+  range_indicator <- FALSE
+  while(overlap_indicator == FALSE | range_indicator == FALSE) {
+
+  ALPHA_init <- runif(1,min = alpha_lo, max = alpha_hi)
+  if(beta_logscale) BETA_init <- exp(runif(1,min = log(beta_lo), max = log(beta_lo))) else{
+    BETA_init <- runif(1,min = beta_lo, max = beta_lo)
+  }
+  # use new values to calculate revised positions
+  theta_corr_init = convertAlphaBeta(posn_cor,ALPHA_init,BETA_init)
+  theta_init <- c(posn_ref,theta_corr_init)
+
+  # check for overlap (input needs to be a list of vectors)
+  overlap_indicator <- .Overlap_check(list(posn_ref,theta_corr_init), ov_min = overlap_min)
+  # Reject thetas outside the range of the knots
+  range_indicator  <- max(theta_init) <= knotRange[2] & min(theta_init) >= knotRange[1]
+
+  }
+  ALPHA[j,1] <- ALPHA_init
+  BETA[j,1] <- BETA_init
+
+  }
+  } else { # if initial values were supplied manually
+    ALPHA[,1] <- ALPHA_init
+    BETA[,1] <- BETA_init
+  }
+  ## Step 2: Create geometric spacing of temperatures, with spacing decreasing with the number of chains.
+  ##         Some randomness is introduced to produce slightly different starting temperatures with different
+  ##         runs.
+  if(is.null(T_init)) {
+  if(nChains >2) {
+  temperature_step <- (nChains-1)^(2/3)/(nChains-2)
+  Tem[2:(nChains-1),1:2] <-
+    10^(cumsum(rep(exp(rnorm(1,log(temperature_step),1/(5*nChains))),nChains-2)))
+  }
+    Tem[1,] <- 1
+    Tem[nChains,] <- Inf
+
+  } else { # if initial values were supplied manually
+    Tem[,1:2] <- T_init
+    Tem[1,] <- T_init[1]
+    Tem[nChains,] <- T_init[nChains]
+  }
+
+
+
+  lambda[,1] <- lambda_init
+  coeff[,1,] <- coeff_init # could get coefficients as inits using smooth.spline?
+  logpost[,1] <- -Inf
+  sdy[,1] <- 1
+
+  t <- 1
+  A[,1] <- 0.5
+
+  ALPHAsd[,1:2] <- ALPHAsd_init
+  ALPHAsd[nChains,] <- 10*(alpha_hi-alpha_lo)
+
+  BETAsd[,1:2] <- BETAsd_init
+  BETAsd[nChains,] <- if(beta_logscale) 10*(log(beta_hi) - log(beta_lo)) else 10*(beta_hi - beta_lo)
+
+
+
+
+  # for sdy
+  n <- length(y)
+  shape_sdy <- A_sdy+n/2
+
+
+  B = list()
+  H = list()
+  tBy = list()
+  Q = list()
+  Ident = diag(1, nrow(D))
+  # precalculations for thetaest initial values and spline
+  for(j in 1:nChains){ # takes data from correlated sequence to reference sequence depth
+    theta_corr = convertAlphaBeta(posn_cor,ALPHA[j,1],BETA[j,1])
+    thetaest[j,1,] <- c(posn_ref,theta_corr)
+    B[[j]] <- splineDesign(ext_knots, thetaest[j,1,], sparse = FALSE)
+    #H[[j]] <- crossprod(sweep(B[[j]], 1, 1/sdy, "*"))
+    H[[j]] <- base::crossprod(B[[j]]/sdy[j,1])
+    tBy[[j]] = t(B[[j]]) %*% as.vector(y/sdy[j,1]^2)
+  }
+
+  ############################## SAMPLER - FIND THE POSTERIOR ##################################
+
+  # Now the sampler itself
+  if (!quiet) cli::cli_progress_bar('Sampling', total = nIter)
+  for (i in 2:nIter) {
+        if (!quiet) cli::cli_progress_update(set = i, status = paste0('iteration ', i))
+
+    for (j in 1:nChains){
+      # Step 1: Gibbs Sampling Step
+      # Update beta the spline coefficients
+      # Evaluate B matrix at the current values of theta
+
+      Q[[j]] <- .MakeSymmetric(solve.default(H[[j]] + lambda[j,i-1]*D,Ident))
+
+      #coeff[j,i, ] <- rmvn(1, mu = as.vector(Q[[j]] %*% tBy[[j]]), sigma = as.matrix(Q[[j]]))
+      coeff[j,i, ] <- rmvn(1, mu = Q[[j]] %*% tBy[[j]], sigma = Q[[j]], isChol = FALSE)
+
+      # Step 2: Gibbs Sampling Step
+      # Update lambda the smoothing coefficient for the spline coefficients
+      # mean is Alam * Blam as here Blam is scale, and mode is (Alam-1)*Blam
+      lambda[j,i] <- Updatelambda(beta = coeff[j,i,], D = D, Alam = Alam, Blam = Blam,
+                                  nbasis = num_basis)
+
+      # Step 3: Gibbs sampling step
+      #
+      # Update sdy the scatter of the data around the fitted line
+      # prior on sdy^2 is invgamma(3,0.1) gives prior on sdy with mean 0.21, sd 0.076
+      sdy[j,i] = sqrt(1/rgamma(1,shape_sdy,B_sdy+0.5*sum((y-B[[j]]%*% coeff[j,i, ])^2)))
+
+
+
+
+      # Step 4: Metropolis Hastings Step
+      ### LOOP BACK TO HERE if there is no overlap ###
+      # propose new values for ALPHA and BETA
+
+      # create or reset overlap and range indicators for the next iteration
+      overlap_indicator <- FALSE
+      range_indicator <- FALSE
+
+      while(overlap_indicator == FALSE | range_indicator == FALSE) {
+
+
+           ALPHA_new[j,i] <- msm::rtnorm(1,mean=(ALPHA[j,i-1]),
+                                          sd=ALPHAsd[j,i],#*(alpha_hi-alpha_lo),
+                                          lower=alpha_lo,upper=alpha_hi)
+
+          if(beta_logscale){
+            BETA_new[j,i] <- exp(msm::rtnorm(1,mean=log(BETA[j,i-1]),
+                                             sd=BETAsd[j,i],#*(log(beta_hi)-log(beta_lo)),
+                                             lower=log(beta_lo),upper=log(beta_hi) ))
+          } else {
+            BETA_new[j,i] <- msm::rtnorm(1,mean=(BETA[j,i-1]),
+                                         sd=BETAsd[j,i],#*(beta_hi-beta_lo),
+                                         lower=beta_lo,upper=beta_hi)
+          }
+
+
+        ### CHECK WHETHER WE HAVE OVERLAP ###
+
+        # use new values to calculate revised positions
+        theta_corr_new = convertAlphaBeta(posn_cor,ALPHA_new[j,i],BETA_new[j,i])
+        theta_new[j,i,] <- c(posn_ref,theta_corr_new)
+
+        # check for overlap (input needs to be a list of vectors)
+        overlap_indicator <- .Overlap_check(list(posn_ref,theta_corr_new), ov_min = overlap_min)
+        # Reject thetas outside the range of the knots
+        range_indicator  <- max(theta_new[j,i,]) <= knotRange[2] & min(theta_new[j,i,]) >= knotRange[1] # changed from | to &
+        # else cli::cli_alert_warning("Theta outside knot range")
+
+      }
+
+      # calculate posterior density at old position
+      # determine the likelihood of the data with the previous position
+      ylikold = loglik(B[[j]],coeff[j,i,],y,sdy[j,i])
+      # find prior densities of the old BETAs
+      priorold_ALPHA <- logprior_ALPHA(ALPHA[j,i-1], alpha_lo, alpha_hi)
+      priorold_BETA <- logprior_BETA(BETA[j,i-1], beta_lo, beta_hi)
+      # Find old log-posterior densities
+      logpostold[j,i] <- sum(ylikold, priorold_ALPHA, priorold_BETA)
+
+      # calculate posterior density at new position
+
+      # determine the likelihood of the data with the new position
+      B_new <- splineDesign(ext_knots, theta_new[j,i,], sparse = FALSE)
+      #if(j == 1) {B_new_c1[[i]] <- B_new  # add if you want to monitor B
+      #            B_old_c1[[i]] <- B[[j]] }
+      yliknew = loglik(B_new,coeff[j,i,],y,sdy[j,i])
+
+      # find prior densities of the new BETAs
+      priornew_ALPHA <- logprior_ALPHA(ALPHA_new[j,i], alpha_lo, alpha_hi)
+      priornew_BETA <- logprior_BETA(BETA_new[j,i], beta_lo, beta_hi)
+
+      # Find log-posterior densities
+      logpostnew[j,i] <- sum(yliknew, priornew_ALPHA, priornew_BETA)
+
+      # Hastings Ratio
+      HR[j,i] <- exp((logpostnew[j,i] - logpostold[j,i])/Tem[j,i])
+
+      # Now decide whether to accept or reject and update values accordingly
+      accept[j,i] = (runif(1) < HR[j,i])
+      if (accept[j,i]){
+
+        ALPHA[j,i]<-ALPHA_new[j,i]
+        BETA[j,i]<-BETA_new[j,i]
+        thetaest[j,i,]<-theta_new[j,i,]
+        logpost[j,i] <- logpostnew[j,i]
+        # updating these matrices here saves time in step 1 if there is no change
+        # and is necessary if tempering
+        B[[j]] <-  B_new
+        #      H[[j]] <- crossprod(sweep(B[[j]], 1, 1/sdy, "*",check.margin=FALSE))
+        H[[j]] <- base::crossprod(B[[j]]/sdy[j,i])
+        tBy[[j]] = t(B[[j]]) %*% as.vector(y/sdy[j,i]^2)
+      } else {
+        ALPHA[j,i]<-ALPHA[j,i-1]
+        BETA[j,i]<-BETA[j,i-1]
+        thetaest[j,i,]<-thetaest[j,i-1,]
+        logpost[j,i] <- logpostold[j,i]
+      }
+
+      ## What iteration are we in with regards to the adaptative steps of temperatures?
+      t <-  which(adapt_it >=i & adapt_it-adapt_T_interval < i)
+      if(i>adapt_it[length(adapt_it)-1]) t <- length(adapt_it)
+
+      ### Adapt the SD of the proposals for ALPHA and BETA ###
+      # calculate difference in ALPHA and BETA of the current and the previous
+      # iteration.
+      # adapted from:
+      # Gareth O. Roberts and Jeffrey S. Rosenthal (2009): Examples of Adaptive MCMC,
+      # Journal of Computational and Graphical Statistics, 18:2, 349-367
+      if(j < nChains & i <nIter) {
+      if((adapt_SD!=FALSE) & i <= adapt_SD) {
+        swapped_chains <- chains[i-1]+c(0,1)
+
+        if(temperAccept[i-1] & (j %in% c(chains[i]+c(0,1))) & i >= 3) { # has there been a swap? this needs to be accounted for
+          ALPHA_diff[j,i] <- ALPHA[j,i]-ALPHA[swapped_chains[which(j != swapped_chains),i]]
+          if(beta_logscale) BETA_diff[j,i] <- log(BETA[j,i])-log(BETA[swapped_chains[which(j != swapped_chains),i]]) else {
+          BETA_diff[j,i] <- log(BETA[j,i])-log(BETA[swapped_chains[which(j != swapped_chains),i]])
+          }
+        } else {
+        ALPHA_diff[j,i] <- ALPHA[j,i]-ALPHA[j,i-1]
+        if(beta_logscale) BETA_diff[j,i] <- log(BETA[j,i])-log(BETA[j,i-1]) else {
+                          BETA_diff[j,i] <- BETA[j,i]-BETA[j,i-1]
+        }
+        }
+
+        if(i >=3 & i != (adapt_it[t]-adapt_T_interval+1)) { #& i!= (last_adapt_T+1)) {
+
+          # calculate variance from all iterations at the current temperature
+
+
+            weights = allWeights[(nIter-i+2):nIter-1]
+            sumWeights = sum(weights)
+            weightedVarALPHA <- .weightedVar(ALPHA_diff[j,2:i],
+                                            weights = weights, sumWeights = sumWeights)
+            weightedVarBETA <- .weightedVar(BETA_diff[j,2:i],
+                                           weights = weights, sumWeights = sumWeights)
+
+
+          v_ALPHA[j,i] <- ifelse(weightedVarALPHA==0,
+                                 ALPHAsd[j,i]^2/10,
+                                 2.4^2 * weightedVarALPHA)
+
+          v_BETA[j,i] <- ifelse(weightedVarBETA==0,
+                                BETAsd[j,i]^2/10,
+                                2.4^2 * weightedVarBETA)
+
+
+          ALPHAsd[j,i+1] <- sqrt(v_ALPHA[j,i])
+          BETAsd[j,i+1] <- sqrt(v_BETA[j,i])
+        } else {
+          ALPHAsd[j,i+1] <- ALPHAsd[j,i]
+          BETAsd[j,i+1] <- BETAsd[j,i]
+           }
+
+
+      } else if(i<nIter) {
+        ALPHAsd[j,i+1] <- ALPHAsd[j,i]
+        BETAsd[j,i+1] <- BETAsd[j,i]
+
+      }
+      }
+
+
+
+
+
+      ### ADD IN
+      # end condition if new value is e.g. less than 1 % different from the previous
+      # value -- > stop adapting
+
+
+    } # end of j in 1:nChains
+
+    #### Tempering ####
+    # if tempering propose and accept or reject a swap between chains
+    # follows parallel tempering equation 11 in
+    # Malcolm Sambridge, 2014, A Parallel Tempering algorithm for
+    # probabilistic sampling and multimodal optimization,  Geophysical Journal
+    # International 196 357–374
+    # https://academic.oup.com/gji/article/196/1/357/585739
+
+    if(any(tempering)){
+      chains[i] = sample.int(nChains-1,1)
+
+      for(j in 1:(nChains-1)) {
+        temperRatio[j,i] = exp( (logpost[j,i]-logpost[j+1,i])/Tem[j+1,i] +
+                                  (logpost[j+1,i]-logpost[j,i])/Tem[j,i]  )
+
+#        temperRatio[i] = exp( (logpost[chains[1,i],i]-logpost[chains[2,i],i])/T[chains[2,i]] +
+#                                (logpost[chains[2,i],i]-logpost[chains[1,i],i])/T[chains[1,i]]  )
+
+#        if(temperRatioAll) {temperRatioCapped[j,i] = min(c(temperRatio[j,i],1))} else{
+#          temperRatioCapped[i] = min(c(temperRatio[chains[i],i],1))
+        temperRatioCapped[j,i] = min(c(temperRatio[j,i],1))
+
+        }
+
+#      }
+
+#    }
+
+      ### CALCULATE for all pairs
+
+      #     print(chains[,i])
+      #     if(is.na(temperRatio[i])) {
+      #        temperRatio[i] = 0
+      #        cli::cli_alert_warning("is.na(temperRatio)==TRUE")
+      #        }
+      temperAccept[i] =  (runif(1) < temperRatio[chains[i],i])
+      # if needed swap the chains
+      if (temperAccept[i]){
+        ALPHA[chains[i]+c(0,1),i] = ALPHA[chains[i]+c(1,0),i]
+        BETA[chains[i]+c(0,1),i] = BETA[chains[i]+c(1,0),i]
+        B[chains[i]+c(0,1)] = B[chains[i]+c(1,0)]
+        H[chains[i]+c(0,1)] = H[chains[i]+c(1,0)]
+        tBy[chains[i]+c(0,1)] = tBy[chains[i]+c(1,0)]
+        coeff[chains[i]+c(0,1),i,] = coeff[chains[i]+c(1,0),i,]
+        lambda[chains[i]+c(0,1),i] = lambda[chains[i]+c(1,0),i]
+        thetaest[chains[i]+c(0,1),i,] = thetaest[chains[i]+c(1,0),i,] # changed from <- to =
+        logpost[chains[i]+c(0,1),i] = logpost[chains[i]+c(1,0),i]
+      } #### Is there anything new that needs to swap?
+
+
+      ### Adapt
+
+
+      if ((adapt_T != FALSE) & (i == adapt_it[t])) {
+
+          indices <- (i-adapt_T_interval+1):adapt_it[t]
+
+          if (adapt_T_allratios & adapt_T_interval > 1) {
+            A[2:nChains,t] <- rowMeans(temperRatioCapped[1:(nChains-1),indices])
+          }
+          if (adapt_T_allratios & adapt_T_interval == 1) {
+            A[2:nChains,t] <- temperRatioCapped[1:(nChains-1),i]
+          }
+            if(adapt_T_allratios == FALSE) {
+            for(j in 2:nChains) {
+              A[j,t] <- mean(temperRatioCapped[j-1,indices[which(chains[indices] == j-1)]])
+            }
+          }
+          A[is.na(A[,t]),t] <- A[is.na(A[,t]),t-1] # to prevent crash if missing swap combination
+
+          # set Temperature of the cold chain to 1
+          #Tem[1,i+1] <- T_init[1]
+
+          # update temperatures
+          for (j in 2:(nChains-1)) {
+
+            if(t_null == FALSE) {dS[j,t] <- (A[j,t] - A[j+1,t])
+              } else dS[j,t] <-  (t_null+1)/(t+t_null) * (A[j,t] - A[j+1,t])
+
+            Tem[j,i+1] <- exp(dS[j,t]) * (Tem[j,i]-Tem[j-1,i]) + Tem[j-1,i+1]
+          }
+
+          #  set hot chain temperature (usuallty Inf)
+          #Tem[nChains,i+1] <- T_init[nChains]
+
+
+      } else if(i< nIter) Tem[,i+1] <- Tem[,i]
+
+}
+
+        #### Visualize progress ####
+    if (visualise) {
+      if((i %% visualise) == 0) {
+        rng <- seq_len(i)
+        oldpar = par(no.readonly = TRUE)
+        par(mfrow = 2:1, mar = c(2.5, 2.5, 0.5, 0.5), mgp = c(1.5, 0.75, 0))
+        par(mar = c(3, 3, 1, 3))
+        #plot(rng,lambda[rng],type='l',xaxt = "n", yaxt = "n",ylab = "", xlab = "")
+        matplot(rng,t(lambda[,rng,drop=FALSE]),type='l',xaxt = "n", yaxt = "n",ylab = "",
+                xlab = "",col=1,lty=1:nChains)
+        axis(side = 4)
+        mtext("lambda", side = 4, line = 2)
+        par(new=TRUE)
+        plot(NULL, xlim = c(0, i), ylim = c(min(alpha_lo,beta_lo), max(alpha_hi,beta_hi)),
+             xlab = 'Iteration', ylab = 'Beta 1 / 2')
+        #        legend('right', bty = 'n', legend = paste0(c("ALPHA=","BETA="),signif(c(ALPHA[i], BETA[i]))),
+        #               col = c(2, 3), pch = 1)
+        matpoints(rng, t(ALPHA_new[,rng,drop=FALSE]), col = 2, pch = '.')
+        matpoints(rng, t(BETA_new[,rng,drop=FALSE]), col = 3, pch = '.')
+        matpoints(rng, t(ALPHA[,rng,drop=FALSE]), col = 2, pch=1:nChains)
+        matpoints(rng, t(BETA[,rng,drop=FALSE]), col = 3, pch=1:nChains)
+
+        matplot(rng, t(logpost[,rng,drop=FALSE]), pch = '.',
+                xlab = 'Iteration', ylab = 'log posterior')
+        #        legend("right", bty='n', legend=paste0("Acceptance ",sum(accept[(i-99):i],na.rm=TRUE),"%"))
+        if (i>100){
+          par(new=TRUE)
+          runmeanAccept = sapply(1:nChains,function(jj){
+            sapply(100:i,function(ii,jj){mean(accept[jj,(ii-99):ii],na.rm=TRUE)},jj=jj)
+          })
+          matplot(100:i,runmeanAccept,
+                  col="blue", xaxt="n", yaxt="n", ylab="", xlab = "",
+                  ylim=c(0,1),xlim = c(0, i), pch=1:nChains)
+          axis(side = 4,col.axis ="blue")
+          mtext("Acceptance (last 100 iter)", side = 4, line = 2,col="blue")
+        }
+        par(oldpar)
+      }
+    }
+  } # end of i in 2:nIter
+
+    output = list(
+    call = match.call(), #c(as.list(environment())),
+    ALPHA = ALPHA,
+    BETA = BETA,
+    thetaest = thetaest[,,(test_data$N[1]+1):sum(test_data$N)],
+    coeff = coeff,
+    lambda = lambda,
+    sdy = sdy,
+    ext_knots = ext_knots,
+    logpost = logpost,
+    accept = accept,
+    ALPHAsd = ALPHAsd,
+    BETAsd = BETAsd,
+    Tem = Tem,
+    chains = chains,
+    temperAccept = temperAccept,
+    adapt_it = adapt_it
+  )
+  class(output) = "CSM_MCMC"
+  return(output)
+
+}
+
+
+
+#' utility function to make a matrix symmetric
+#' @param mat a matrix
+.MakeSymmetric <- function (mat) {
+  if(!isSymmetric.matrix(mat,tol=0)){
+    lwrtri <- lower.tri(mat)
+    mat[lwrtri] <- t(mat)[lwrtri]
+  }
+  mat
+}
+
+# functions to generate weighted mean and weighted variance for the SD proposal
+# adaptation
+
+.weightedVar <- function(x, weights, sumWeights) {
+  sum(weights*((x-sum(weights*x)/sumWeights)^2))/(sumWeights)
+}
+
+#' utility function to check for the length of overlap between numeric vectors.
+#' i.e. the number of data points that overlap
+# lower number of overlapping points between two vectors
+#### WRITE DESCRIPTION
+
+.OverlapN <- function(a,b) {
+  if(min(a) <= max(b) & max(a) >= min(b)) {
+    min(as.integer(length(a[which(a >= max(c(min(a),min(b))) &
+                                    a <= min(c(max(a),max(b))))])),
+        as.integer(length(b[which(b >= max(c(min(a),min(b))) &
+                                    b <= min(c(max(a),max(b))))])))
+  } else 0L
+}
+
+#### WRITE DESCRIPTION
+.Overlap_check <- function(x,ov_min = 15) {
+  lx <- length(x)
+  # check if the section heights are provided as a list
+  if (!(is.list(x))) {
+    stop("x must be a list.")
+  }
+  # determine the shortest overlap, output TRUE if it is long enough
+  overlap_mat <- vapply(1:lx,function(y) vapply(1:lx, function(z)
+    .OverlapN(x[[y]],x[[z]]), integer(1)), integer(lx))
+  diag(overlap_mat) <- 0L
+
+  !(any(rowSums(overlap_mat >= ov_min)==0))
+
+}
+
+plot.CSM_MCMC = function(
+  x,
+  chain = 1,
+  gridSize = 200,
+  nBurn = NA,
+  upperQuantile=0.975,
+  lowerQuantile=0.025,
+  xlim = "all",
+  ylim=NA,
+  samples = FALSE,
+  ...
+){
+  # set posterior sample to use
+  if (is.na(nBurn)) nBurn <- floor(x$call$nIter/2)
+  sampled = (nBurn+1):x$call$nIter
+  # calculate the posterior mean with upper and lower bounds on a grid
+  posn_grid <- seq(min(x$ext_knots), max(x$ext_knots),length.out=gridSize)
+  B_grid <- splineDesign(x$ext_knots, posn_grid, sparse = FALSE)
+  fest <- B_grid %*% t(x$coeff[chain,sampled,])
+  festmean <- apply(fest, 1, mean)
+  festub <- apply(fest, 1, quantile, probs = upperQuantile)
+  festlb <- apply(fest, 1, quantile, probs = lowerQuantile)
+
+  # calculate correlated data scaled at mean ALPHA, BETA
+  valid = !(is.na(x$call$x$height)|is.na(x$call$x$proxy)) # list of valid lines of data
+  meanALPHA = mean(x$ALPHA[chain,sampled])
+  meanBETA = mean(x$BETA[chain,sampled])
+  plot_var =  convertAlphaBeta(x$call$x$height[2,][valid[2,]], meanALPHA,
+                               meanBETA)
+  # set x limits
+  if(xlim=="all"){
+    xlim = range(x$ext_knots)
+  } else if (xlim=="data") {
+    xlim = range(pretty(c(plot_var,x$call$x$height[1,])))
+  }
+  # set y limits
+  if (any(is.na(ylim))) {
+    xlim_grid = posn_grid<=xlim[2] & posn_grid>=xlim[1]
+    ylim=range(pretty(c(x$call$x$proxy,festub[xlim_grid],festlb[xlim_grid])))
+  }
+  # create plot
+  plot(NULL, xlim=xlim, ylim=ylim,
+       xlab=paste0("height (",x$call$x$height.units,")"),
+       ylab="", ...)
+  # plot samples if required
+  if(samples) {
+    if(isTRUE(samples)) samples = 10
+    chosen = sample.int(length(sampled),samples)
+    lines(rep(c(posn_grid,NA),samples), rbind(fest[,chosen],rep(NA,samples)),
+          col = "darkgrey")
+  }
+  # plot ref data
+  points(x$call$x$height[1,], x$call$x$proxy[1,], type = "b", pch = 19,
+         col="black")
+  title(ylab=substitute(a * b * c * d,list(a=x$call$x$proxy.name,
+                                           b=" (",c=x$call$x$proxy.units,d=")")),
+        line=2.5)
+  # plot correlated data
+  points(plot_var, x$call$x$proxy[2,][valid[2,]], type = "b", pch = 19,
+         col = "green3")
+  # mark changepoint
+  # abline(v=x$call$changepoint, col="blue")
+  # Plot the posterior mean with upper and lower bounds
+  lines(posn_grid, festmean, col = "red")
+  lines(posn_grid, festub, col = "red", lty = 2)
+  lines(posn_grid, festlb, col = "red", lty = 2)
+  rug(x$ext_knot,col="green3",quiet=TRUE)
+  legend("topright",legend=c(paste0("mean ALPHA: ",signif(meanALPHA,3) ),
+                             paste0("mean BETA: ",signif(meanBETA,3) )))
+  legend("topleft",legend=c(x$call$x$localities,"spline",
+                            paste0(lowerQuantile,"-",upperQuantile," quantiles")),
+         col=c("black","green3","red","red"),lty=c(1,1,1,2))
+
+}
+
