@@ -7,7 +7,9 @@
 climate_bins(interval)
 }
 \arguments{
-\item{interval}{A character string matching an interval available in NAME of \code{GTS2020}.}
+\item{interval}{\code{character or numeric}. Interval name or age available in \code{GTS2020}. If a single interval name is provided, this interval is returned.
+If two interval names are provided, these intervals and those existing between are returned. If a single interval age is provided, the age matching this interval is returned.
+If two interval ages are provided, the intervals occurring in the range of these ages are returned.}
 }
 \value{
 A \code{data.frame} of climatic bins for a specified interval.
@@ -16,6 +18,12 @@ A \code{data.frame} of climatic bins for a specified interval.
 A function which return climatic bins for a given time interval.
 }
 \examples{
-lat_bins(size = 20)
-lat_bins(size = 13, fit = TRUE)
+Using a single interval
+climate_bins(interval = "Maastrichtian")
+Using multiple intervals
+climate_bins(interval = c("Albian", "Maastrichtian"))
+Using interval midpoint age
+climate_bins(interval = 100)
+Using interval age range
+climate_bins(interval = c(50, 100))
 }
